@@ -39,7 +39,7 @@ async def async_setup_entry(
                 "sensor_1",
                 "sensor_1",
                 "Outside Temperature",
-                15.6,
+                22.0,  # Simulated Celsius reading; no physical sensor is needed.
                 SensorDeviceClass.TEMPERATURE,
                 SensorStateClass.MEASUREMENT,
                 UnitOfTemperature.CELSIUS,
