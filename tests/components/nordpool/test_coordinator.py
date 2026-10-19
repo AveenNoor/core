@@ -1,9 +1,10 @@
 """The test for the Nord Pool coordinator."""
 
+from contextlib import ExitStack
 from datetime import timedelta
 from http import HTTPStatus
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from freezegun.api import FrozenDateTimeFactory
 from pynordpool import (
@@ -18,14 +19,124 @@ from pynordpool import (
 import pytest
 
 from homeassistant.components.nordpool.const import DOMAIN
+from homeassistant.components.nordpool.coordinator import NordPoolDataUpdateCoordinator
 from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from . import ENTRY_CONFIG
 
 from tests.common import MockConfigEntry, async_fire_time_changed
 from tests.test_util.aiohttp import AiohttpClientMocker
+
+
+@pytest.mark.freeze_time("2025-10-01T10:00:00+02:00")
+async def test_coordinator_timer_unload(
+    hass: HomeAssistant,
+    load_int: MockConfigEntry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test that unloading stops the timer after it has rescheduled."""
+    coordinator = load_int.runtime_data
+    with patch.object(
+        coordinator, "async_update_listeners", wraps=coordinator.async_update_listeners
+    ) as notify:
+        freezer.tick(timedelta(minutes=15))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done(wait_background_tasks=True)
+        notify.assert_called_once_with()
+        notify.reset_mock()
+
+        cancel = MagicMock(wraps=coordinator.listener_unsub)
+        coordinator.listener_unsub = cancel
+        assert await hass.config_entries.async_unload(load_int.entry_id)
+        await hass.async_block_till_done(wait_background_tasks=True)
+        await coordinator.async_shutdown()
+        await coordinator.async_shutdown()
+        cancel.assert_called_once_with()
+        assert coordinator.listener_unsub is None
+
+        for _ in range(2):
+            freezer.tick(timedelta(minutes=15))
+            async_fire_time_changed(hass)
+            await hass.async_block_till_done(wait_background_tasks=True)
+            notify.assert_not_called()
+
+
+@pytest.mark.freeze_time("2025-10-01T10:00:00+02:00")
+async def test_coordinator_callback_after_shutdown(
+    hass: HomeAssistant,
+    load_int: MockConfigEntry,
+) -> None:
+    """Test that an already dispatched callback cannot restart the timer."""
+    coordinator = load_int.runtime_data
+    assert await hass.config_entries.async_unload(load_int.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    with (
+        patch.object(coordinator, "async_update_listeners") as notify,
+        patch(
+            "homeassistant.components.nordpool.coordinator.async_track_point_in_utc_time"
+        ) as schedule,
+    ):
+        await coordinator.update_listeners(dt_util.utcnow())
+        notify.assert_not_called()
+        schedule.assert_not_called()
+
+
+@pytest.mark.usefixtures("get_client")
+@pytest.mark.freeze_time("2025-10-01T10:00:00+02:00")
+async def test_coordinator_repeated_load_unload(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test that only the loaded coordinator notifies listeners across reloads."""
+    entry = MockConfigEntry(domain=DOMAIN, source=SOURCE_USER, data=ENTRY_CONFIG)
+    entry.add_to_hass(hass)
+    previous_notifications: list[MagicMock] = []
+
+    with ExitStack() as stack:
+        for _ in range(3):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done(wait_background_tasks=True)
+            coordinator = entry.runtime_data
+            notify = stack.enter_context(
+                patch.object(
+                    coordinator,
+                    "async_update_listeners",
+                    wraps=coordinator.async_update_listeners,
+                )
+            )
+
+            freezer.tick(timedelta(minutes=15))
+            async_fire_time_changed(hass)
+            await hass.async_block_till_done(wait_background_tasks=True)
+            notify.assert_called_once_with()
+            for previous in previous_notifications:
+                previous.assert_not_called()
+            notify.reset_mock()
+            previous_notifications.append(notify)
+
+            assert await hass.config_entries.async_unload(entry.entry_id)
+            await hass.async_block_till_done(wait_background_tasks=True)
+            freezer.tick(timedelta(minutes=15))
+            async_fire_time_changed(hass)
+            await hass.async_block_till_done(wait_background_tasks=True)
+            for previous in previous_notifications:
+                previous.assert_not_called()
+
+
+async def test_coordinator_shutdown_before_setup(hass: HomeAssistant) -> None:
+    """Test repeated shutdown when no listener timer has been scheduled."""
+    entry = MockConfigEntry(domain=DOMAIN, source=SOURCE_USER, data=ENTRY_CONFIG)
+    entry.add_to_hass(hass)
+    coordinator = NordPoolDataUpdateCoordinator(hass, entry)
+
+    await coordinator.async_shutdown()
+    await coordinator.async_shutdown()
+
+    assert coordinator.listener_unsub is None
 
 
 @pytest.mark.freeze_time("2025-10-01T10:00:00+02:00")
