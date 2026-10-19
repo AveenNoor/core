@@ -54,6 +54,14 @@ class NordPoolDataUpdateCoordinator(DataUpdateCoordinator[DeliveryPeriodsData]):
         self.client = NordPoolClient(session=async_get_clientsession(hass))
         self.listener_unsub: Callable[[], None] | None = None
 
+    @override
+    async def async_shutdown(self) -> None:
+        """Cancel scheduled updates."""
+        await super().async_shutdown()
+        if self.listener_unsub:
+            self.listener_unsub()
+            self.listener_unsub = None
+
     def get_next_15_interval(self, now: datetime) -> datetime:
         """Compute next time we need to notify listeners."""
         next_run = get_nordpool_current_time() + timedelta(minutes=15)
@@ -67,6 +75,9 @@ class NordPoolDataUpdateCoordinator(DataUpdateCoordinator[DeliveryPeriodsData]):
 
     async def update_listeners(self, now: datetime) -> None:
         """Update entity listeners every 15 minutes."""
+        if self._shutdown_requested:
+            return
+
         self.listener_unsub = async_track_point_in_utc_time(
             self.hass,
             self.update_listeners,
