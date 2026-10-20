@@ -1,8 +1,8 @@
 """DataUpdateCoordinator for the Nord Pool integration."""
 
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING, Any, override
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, override
 
 import aiohttp
 from aiozoneinfo import get_time_zone
@@ -132,74 +132,84 @@ class NordPoolDataUpdateCoordinator(DataUpdateCoordinator[DeliveryPeriodsData]):
     @override
     async def _async_update_data(self) -> DeliveryPeriodsData:
         """Fetch the latest data from Nord Pool."""
-        data: dict[date, DeliveryPeriodData] = {}
-
-        today_data = self.get_data_current_day() if self.has_current_day_data else None
-        tomorrow_data = self.get_data_tomorrow() if self.has_tomorrow_data else None
-
-        if today_data and tomorrow_data:
+        if self.has_current_day_data and self.has_tomorrow_data:
             # Bail early if we already have all data
             return self.data
 
-        if not today_data:
-            try:
-                today_data = await self._api_call(0)
-            except (
-                NordPoolError,
-                TimeoutError,
-                aiohttp.ClientError,
-            ) as error:
-                raise UpdateFailed(
-                    translation_domain=DOMAIN,
-                    translation_key="connection_error",
-                ) from error
+        today_data = await self._async_get_or_fetch_today_data()
+        tomorrow_data = await self._async_get_or_fetch_tomorrow_data()
+        return self._build_delivery_periods_data(today_data, tomorrow_data)
 
-            if today_data and not today_data.entries:
-                raise UpdateFailed(
-                    translation_domain=DOMAIN,
-                    translation_key="no_day_data",
-                )
+    async def _async_get_or_fetch_today_data(self) -> DeliveryPeriodData:
+        """Get current day data from cache or fetch it from the API."""
+        if self.has_current_day_data:
+            return self.get_data_current_day()
 
-        if not tomorrow_data:
-            try:
-                tomorrow_data = await self._api_call(1)
-            except NordPoolEmptyResponseError:
-                pass
-            except (
-                NordPoolError,
-                TimeoutError,
-                aiohttp.ClientError,
-            ) as error:
-                LOGGER.debug("Error getting prices for tomorrow: %s", error)
+        today_data = await self._async_fetch_today_data()
+        if not today_data or not today_data.entries:
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="no_day_data",
+            )
+        return today_data
 
-        if tomorrow_data and not tomorrow_data.entries:
-            tomorrow_data = None
+    async def _async_fetch_today_data(self) -> DeliveryPeriodData | None:
+        """Fetch today's data; any connection problem is fatal for the update."""
+        try:
+            return await self._api_call(0)
+        except (
+            NordPoolError,
+            TimeoutError,
+            aiohttp.ClientError,
+        ) as error:
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="connection_error",
+            ) from error
 
-        yesterday = (get_nordpool_current_time() - timedelta(days=1)).date()
-        yesterday_raw: dict[str, Any] = self.data.raw[yesterday.isoformat()]
-        yesterday_data = self.data.entries.get(
-            (get_nordpool_current_time() - timedelta(days=1)).date()
-        )
+    async def _async_get_or_fetch_tomorrow_data(self) -> DeliveryPeriodData | None:
+        """Get tomorrow's data from cache or fetch it from the API."""
+        if self.has_tomorrow_data:
+            return self.get_data_tomorrow()
 
-        if TYPE_CHECKING:
-            assert today_data
-            assert yesterday_data
+        tomorrow_data = await self._async_fetch_tomorrow_data()
+        return tomorrow_data if tomorrow_data and tomorrow_data.entries else None
 
-        data[get_nordpool_current_time().date()] = today_data
-        raw_data: dict[str, dict[str, Any]] = {
-            today_data.raw["deliveryDateCET"]: today_data.raw
+    async def _async_fetch_tomorrow_data(self) -> DeliveryPeriodData | None:
+        """Fetch tomorrow's data; failure is not fatal (prices may not be out yet)."""
+        try:
+            return await self._api_call(1)
+        except NordPoolEmptyResponseError:
+            return None
+        except (
+            NordPoolError,
+            TimeoutError,
+            aiohttp.ClientError,
+        ) as error:
+            LOGGER.debug("Error getting prices for tomorrow: %s", error)
+            return None
+
+    def _build_delivery_periods_data(
+        self, today_data: DeliveryPeriodData, tomorrow_data: DeliveryPeriodData | None
+    ) -> DeliveryPeriodsData:
+        """Combine cached yesterday data with today's and optional tomorrow's."""
+        today = get_nordpool_current_time().date()
+        yesterday = today - timedelta(days=1)
+
+        entries = {
+            yesterday: self.data.entries[yesterday],
+            today: today_data,
+        }
+        raw = {
+            yesterday.isoformat(): self.data.raw[yesterday.isoformat()],
+            today_data.raw["deliveryDateCET"]: today_data.raw,
         }
 
-        raw_data[yesterday.isoformat()] = yesterday_raw
-        data[yesterday] = yesterday_data
-
         if tomorrow_data:
-            raw_data[tomorrow_data.raw["deliveryDateCET"]] = tomorrow_data.raw
-            data[(get_nordpool_current_time() + timedelta(days=1)).date()] = (
-                tomorrow_data
-            )
+            entries[today + timedelta(days=1)] = tomorrow_data
+            raw[tomorrow_data.raw["deliveryDateCET"]] = tomorrow_data.raw
 
-        return DeliveryPeriodsData(raw=raw_data, entries=data)
+        return DeliveryPeriodsData(raw=raw, entries=entries)
 
     async def _api_call(self, days: int) -> DeliveryPeriodData | None:
         """Make api call to retrieve data."""
